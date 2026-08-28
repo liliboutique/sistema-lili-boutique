@@ -85,5 +85,5 @@ app.get(/.*/, (req, res) => {
 });
 
 app.listen(PORT, () => {
-    console.log(`Servidor de Samson Gym ejecutándose en el puerto ${PORT}`);
+    console.log(`Servidor de Lili Boutique ejecutándose en el puerto ${PORT}`);
 });
