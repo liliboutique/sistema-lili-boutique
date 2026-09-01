@@ -13,7 +13,7 @@ apt-get upgrade -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--fo
 pkg install nodejs git -y
 
 echo "[2/4] Clonando el repositorio..."
-git clone https://github.com/eduarbermudezz/sistema-lili-boutique.git mi_sistema
+git clone https://github.com/liliboutique/sistema-lili-boutique.git mi_sistema
 
 echo "[3/4] Configurando el Backend y Credenciales reales..."
 cd mi_sistema/backend
