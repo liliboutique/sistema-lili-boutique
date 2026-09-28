@@ -1,12 +1,14 @@
 import db from '../config/db.js';
 
+const ID_SUCURSAL_CENTRAL = 1;
+
 const queryPromise = (sql, params) => new Promise((resolve, reject) => db.query(sql, params, (err, results) => err ? reject(err) : resolve(results)));
 
 const generarCodigo13 = (id, index) => {
     const timePart = Date.now().toString().slice(-8); 
     const idPart = id.toString().padStart(3, '0').slice(-3);
     const idxPart = index.toString().padStart(1, '0').slice(-1);
-    return `2${timePart}${idPart}${idxPart}`; 
+    return `2\({timePart}\){idPart}${idxPart}`; 
 };
 
 const validarIntegridadProducto = (nombre, margen, presentaciones) => {
@@ -22,9 +24,8 @@ const validarIntegridadProducto = (nombre, margen, presentaciones) => {
 };
 
 export const obtenerProductos = async (req, res) => {
-    const id_sucursal = req.user?.id_sucursal || 1;
     try {
-       const sql = `
+        const sql = `
             SELECT p.*, 
                    c.descrip_categ as categoria, 
                    GROUP_CONCAT(pr.codigo_barras SEPARATOR ', ') as codigos_sku,
@@ -41,11 +42,11 @@ export const obtenerProductos = async (req, res) => {
             FROM productos p
             LEFT JOIN categorias_producto c ON p.categ_prod = c.id_categ
             JOIN presentaciones_producto pr ON p.id_prod = pr.id_producto
-            JOIN inventario_sucursales inv ON pr.id_presentacion = inv.id_presentacion AND inv.id_sucursal = ?
+            LEFT JOIN inventario_sucursales inv ON pr.id_presentacion = inv.id_presentacion AND inv.id_sucursal = ?
             GROUP BY p.id_prod, c.descrip_categ
             ORDER BY p.id_prod DESC
         `;
-        const results = await queryPromise(sql, [id_sucursal]);
+        const results = await queryPromise(sql, [ID_SUCURSAL_CENTRAL]);
         res.status(200).json(results);
     } catch (err) {
         console.error(err);
@@ -55,8 +56,6 @@ export const obtenerProductos = async (req, res) => {
 
 export const crearProducto = async (req, res) => {
     const { nombre_base, categ_prod, margen_ganancia, presentaciones, usa_margen_categoria } = req.body;
-    const id_sucursal = req.user?.id_sucursal || 1;
-
     const errorVal = validarIntegridadProducto(nombre_base, margen_ganancia, presentaciones);
     if (errorVal) return res.status(400).json({ message: errorVal });
 
@@ -64,12 +63,10 @@ export const crearProducto = async (req, res) => {
         const codigosInput = presentaciones
             .map(p => p.codigo_barras?.trim())
             .filter(c => c && c !== '');
-
         if (codigosInput.length > 0) {
             try {
                 const sqlCheck = `SELECT codigo_barras FROM presentaciones_producto WHERE codigo_barras IN (?) LIMIT 1`;
                 const resCheck = await queryPromise(sqlCheck, [codigosInput]);
-                
                 if (resCheck.length > 0) {
                     return res.status(400).json({ message: `El SKU/Código de barras '${resCheck[0].codigo_barras}' ya está siendo utilizado por otro producto en el inventario.` });
                 }
@@ -86,7 +83,7 @@ export const crearProducto = async (req, res) => {
         try {
             await new Promise((res, rej) => connection.beginTransaction(e => e ? rej(e) : res()));
             const sqlProd = `INSERT INTO productos (nombre_base, categ_prod, margen_ganancia, usa_margen_categoria) VALUES (?, ?, ?, ?)`;
-           const resultProd = await queryTx(sqlProd, [nombre_base, categ_prod || null, margen_ganancia, usa_margen_categoria ? 1 : 0]);
+            const resultProd = await queryTx(sqlProd, [nombre_base, categ_prod || null, margen_ganancia, usa_margen_categoria ? 1 : 0]);
             const idProdNuevo = resultProd.insertId;
             
             if (presentaciones && presentaciones.length > 0) {
@@ -94,11 +91,11 @@ export const crearProducto = async (req, res) => {
                     const codigoBarrasFinal = (p.codigo_barras && p.codigo_barras.trim() !== '')
                         ? p.codigo_barras.trim()
                         : generarCodigo13(idProdNuevo, index);
-                        
+                    
                     const sqlPres = `
                         INSERT INTO presentaciones_producto 
-                          (id_producto, codigo_barras, talla, color, costo_usd, precio_venta_usd, cant_minima_mayor, punto_reorden) 
-                          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                           (id_producto, codigo_barras, talla, color, costo_usd, precio_venta_usd, cant_minima_mayor, punto_reorden)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     `;
                     const resPres = await queryTx(sqlPres, [
                         idProdNuevo,
@@ -110,12 +107,13 @@ export const crearProducto = async (req, res) => {
                         p.cant_minima_mayor || 0,
                         p.punto_reorden || 0
                     ]);
+
                     const sqlInv = `INSERT INTO inventario_sucursales (id_presentacion, id_sucursal, stock) VALUES (?, ?, ?)`;
-                    await queryTx(sqlInv, [resPres.insertId, id_sucursal, p.stock || 0]);
+                    await queryTx(sqlInv, [resPres.insertId, ID_SUCURSAL_CENTRAL, p.stock || 0]);
                 }
             }
             await new Promise((res, rej) => connection.commit(e => e ? rej(e) : res()));
-            res.status(201).json({ message: "Producto y variantes creados" });
+            res.status(201).json({ message: "Producto y variantes creados en el inventario general." });
         } catch (error) {
             connection.rollback();
             console.error(error);
@@ -129,12 +127,10 @@ export const crearProducto = async (req, res) => {
 export const actualizarProducto = async (req, res) => {
     const id = req.params.id;
     const { presentaciones, usa_margen_categoria } = req.body;
-
     const nombreFinal = req.body.nombre_base;
     const categoriaFinal = req.body.categ_prod || null;
     const margenSeguro = Number(req.body.margen_ganancia) || 0;
     const usaMargenCatInt = usa_margen_categoria ? 1 : 0;
-    const id_sucursal = req.user?.id_sucursal || 1;
     
     const errorVal = validarIntegridadProducto(nombreFinal, margenSeguro, presentaciones);
     if (errorVal) return res.status(400).json({ message: errorVal });
@@ -143,12 +139,10 @@ export const actualizarProducto = async (req, res) => {
         const codigosInput = presentaciones
             .map(p => p.codigo_barras?.trim())
             .filter(c => c && c !== '');
-
         if (codigosInput.length > 0) {
             try {
                 const sqlCheck = `SELECT codigo_barras FROM presentaciones_producto WHERE codigo_barras IN (?) AND id_producto != ? LIMIT 1`;
                 const resCheck = await queryPromise(sqlCheck, [codigosInput, id]);
-                
                 if (resCheck.length > 0) {
                     return res.status(400).json({ message: `El SKU/Código '${resCheck[0].codigo_barras}' no puede usarse porque ya pertenece a otro producto distinto.` });
                 }
@@ -182,13 +176,13 @@ export const actualizarProducto = async (req, res) => {
                     const codigoBarrasFinal = (p.codigo_barras && p.codigo_barras.trim() !== '')
                         ? p.codigo_barras.trim()
                         : generarCodigo13(id, index);
-                        
+                    
                     if (p.id_presentacion) {
                         const sqlUpdatePres = `
                             UPDATE presentaciones_producto 
-                              SET talla = ?, color = ?, codigo_barras = ?, costo_usd = ?, precio_venta_usd = ?, 
-                                  cant_minima_mayor = ?, punto_reorden = ? 
-                              WHERE id_presentacion = ?
+                               SET talla = ?, color = ?, codigo_barras = ?, costo_usd = ?, precio_venta_usd = ?, 
+                                   cant_minima_mayor = ?, punto_reorden = ?
+                                WHERE id_presentacion = ?
                         `;
                         await queryTx(sqlUpdatePres, [
                             p.talla || null,
@@ -201,12 +195,12 @@ export const actualizarProducto = async (req, res) => {
                             p.id_presentacion
                         ]);
                         const sqlInv = `INSERT INTO inventario_sucursales (id_presentacion, id_sucursal, stock) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE stock = ?`;
-                        await queryTx(sqlInv, [p.id_presentacion, id_sucursal, Number(p.stock) || 0, Number(p.stock) || 0]);
+                        await queryTx(sqlInv, [p.id_presentacion, ID_SUCURSAL_CENTRAL, Number(p.stock) || 0, Number(p.stock) || 0]);
                     } else {
                         const sqlInsertPres = `
                             INSERT INTO presentaciones_producto 
-                              (id_producto, talla, color, codigo_barras, costo_usd, precio_venta_usd, cant_minima_mayor, punto_reorden) 
-                              VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                               (id_producto, talla, color, codigo_barras, costo_usd, precio_venta_usd, cant_minima_mayor, punto_reorden)
+                               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                         `;
                         const resPres = await queryTx(sqlInsertPres, [
                             id,
@@ -219,12 +213,12 @@ export const actualizarProducto = async (req, res) => {
                             p.punto_reorden || 0
                         ]);
                         const sqlInv = `INSERT INTO inventario_sucursales (id_presentacion, id_sucursal, stock) VALUES (?, ?, ?)`;
-                        await queryTx(sqlInv, [resPres.insertId, id_sucursal, Number(p.stock) || 0]);
+                        await queryTx(sqlInv, [resPres.insertId, ID_SUCURSAL_CENTRAL, Number(p.stock) || 0]);
                     }
                 }
             }
             await new Promise((resolve, reject) => connection.commit(e => e ? reject(e) : resolve()));
-            res.status(200).json({ message: "¡Producto actualizado correctamente!" });
+            res.status(200).json({ message: "¡Producto actualizado en el inventario general!" });
         } catch (error) {
             connection.rollback();
             console.error(error);
@@ -245,41 +239,38 @@ export const eliminarProducto = async (req, res) => {
 };
 
 export const obtenerPresentacionesPorProducto = async (req, res) => {
-    const id_sucursal = req.user?.id_sucursal || 1;
     try {
         const sql = `
-            SELECT pp.*, inv.stock
+            SELECT pp.*, IFNULL(inv.stock, 0) as stock
             FROM presentaciones_producto pp
-            JOIN inventario_sucursales inv ON pp.id_presentacion = inv.id_presentacion AND inv.id_sucursal = ?
+            LEFT JOIN inventario_sucursales inv ON pp.id_presentacion = inv.id_presentacion AND inv.id_sucursal = ?
             WHERE pp.id_producto = ?
         `;
-        const results = await queryPromise(sql, [id_sucursal, req.params.id]);
+        const results = await queryPromise(sql, [ID_SUCURSAL_CENTRAL, req.params.id]);
         res.status(200).json(results);
     } catch (err) { res.status(500).json({ message: 'Error al consultar presentaciones.' }); }
 };
 
 export const buscarProductoEscaneado = async (req, res) => {
     const { q } = req.query;
-    const id_sucursal = req.user?.id_sucursal || 1;
-    
     const sql = `
         (SELECT pp.id_presentacion, p.id_prod, p.nombre_base, pp.talla, pp.color, 
-                pp.costo_usd, pp.precio_venta_usd, pp.cant_minima_mayor, inv.stock as stock_sucursal
-         FROM presentaciones_producto pp
-         JOIN productos p ON pp.id_producto = p.id_prod
-         JOIN inventario_sucursales inv ON pp.id_presentacion = inv.id_presentacion AND inv.id_sucursal = ?
+                pp.costo_usd, pp.precio_venta_usd, pp.cant_minima_mayor, IFNULL(inv.stock, 0) as stock_sucursal
+         FROM presentaciones_producto pp 
+         JOIN productos p ON pp.id_producto = p.id_prod 
+         LEFT JOIN inventario_sucursales inv ON pp.id_presentacion = inv.id_presentacion AND inv.id_sucursal = ?
          WHERE pp.codigo_barras = ? LIMIT 15)
         UNION
         (SELECT pp.id_presentacion, p.id_prod, p.nombre_base, pp.talla, pp.color, 
-                pp.costo_usd, pp.precio_venta_usd, pp.cant_minima_mayor, inv.stock as stock_sucursal
-         FROM presentaciones_producto pp
-         JOIN productos p ON pp.id_producto = p.id_prod
-         JOIN inventario_sucursales inv ON pp.id_presentacion = inv.id_presentacion AND inv.id_sucursal = ?
+                pp.costo_usd, pp.precio_venta_usd, pp.cant_minima_mayor, IFNULL(inv.stock, 0) as stock_sucursal
+         FROM presentaciones_producto pp 
+         JOIN productos p ON pp.id_producto = p.id_prod 
+         LEFT JOIN inventario_sucursales inv ON pp.id_presentacion = inv.id_presentacion AND inv.id_sucursal = ?
          WHERE p.nombre_base LIKE ? LIMIT 15)
         LIMIT 15
     `;
     try {
-        const results = await queryPromise(sql, [id_sucursal, q, id_sucursal, `%${q}%`]);
+        const results = await queryPromise(sql, [ID_SUCURSAL_CENTRAL, q, ID_SUCURSAL_CENTRAL, `%${q}%`]);
         res.status(200).json(results);
     } catch (err) { 
         console.error(err);

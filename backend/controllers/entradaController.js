@@ -1,5 +1,7 @@
 import db from '../config/db.js';
 
+const ID_SUCURSAL_INVENTARIO = 1;
+
 const executeQuery = (connection, sql, params) => {
     return new Promise((resolve, reject) => {
         connection.query(sql, params, (err, results) => {
@@ -11,12 +13,10 @@ const executeQuery = (connection, sql, params) => {
 
 export const registrarEntrada = async (req, res) => {
     const { id_prov, total_costo_usd, items } = req.body;
-
     const id_usuario = req.user?.id_usu || req.user?.id;
-    const id_sucursal = req.user?.id_sucursal || 1; 
+    const id_sucursal = req.user?.id_sucursal || 1; // Sede que recibe físicamente
 
     if (!id_usuario) return res.status(401).json({ message: 'Error: No se pudo identificar al usuario. Inicie sesión nuevamente.' });
-
     if (!items || items.length === 0) {
         return res.status(400).json({ message: 'La entrada debe contener al menos un producto.' });
     }
@@ -28,17 +28,15 @@ export const registrarEntrada = async (req, res) => {
         if (Number(item.costo_unitario_usd) < 0) return res.status(400).json({ message: 'El costo unitario de un producto no puede ser negativo.' });
     }
 
-   
     db.getConnection(async (err, connection) => {
         if (err) {
             console.error("Error obteniendo conexión:", err);
             return res.status(500).json({ message: 'Error de conexión al servidor.' });
         }
-
         try {
             await new Promise((resolve, reject) => { connection.beginTransaction(err => err ? reject(err) : resolve()); });
 
-           const sqlEntrada = `INSERT INTO entradas_inventario (id_usuario, id_sucursal, id_prov, total_costo_usd, fecha) VALUES (?, ?, ?, ?, NOW())`;
+            const sqlEntrada = `INSERT INTO entradas_inventario (id_usuario, id_sucursal, id_prov, total_costo_usd, fecha) VALUES (?, ?, ?, ?, NOW())`;
             const resultEntrada = await executeQuery(connection, sqlEntrada, [
                 id_usuario,
                 id_sucursal,
@@ -47,7 +45,6 @@ export const registrarEntrada = async (req, res) => {
             ]);
             
             const idEntrada = resultEntrada.insertId;
-
             const sqlDetalles = `INSERT INTO detalles_entrada (id_entrada, id_presentacion, id_producto, cantidad_recibida, costo_unitario_usd, subtotal_usd) VALUES ?`;
             const valoresDetalles = items.map(item => [
                 idEntrada,
@@ -57,20 +54,19 @@ export const registrarEntrada = async (req, res) => {
                 Number(item.costo_unitario_usd) || 0,
                 (Number(item.cantidad) * (Number(item.costo_unitario_usd) || 0))
             ]);
-
             await executeQuery(connection, sqlDetalles, [valoresDetalles]);
 
             const promesasInventario = items.map(async (item) => {
-                const cantidadIngresada = Number(item.cantidad);
-                const nuevoCostoUsd = Number(item.costo_unitario_usd) || 0;
-                const idPresentacion = item.id_presentacion;
+    const cantidadIngresada = Number(item.cantidad);
+    const nuevoCostoUsd = Number(item.costo_unitario_usd) || 0;
+    const idPresentacion = item.id_presentacion;
 
-                const sqlUpdateStock = `
-                    INSERT INTO inventario_sucursales (id_presentacion, id_sucursal, stock) 
-                    VALUES (?, ?, ?) 
-                    ON DUPLICATE KEY UPDATE stock = stock + VALUES(stock)
-                `;
-                await executeQuery(connection, sqlUpdateStock, [idPresentacion, id_sucursal, cantidadIngresada]);
+    const sqlUpdateStock = `
+        INSERT INTO inventario_sucursales (id_presentacion, id_sucursal, stock) 
+        VALUES (?, ?, ?) 
+        ON DUPLICATE KEY UPDATE stock = stock + VALUES(stock)
+    `;
+                await executeQuery(connection, sqlUpdateStock, [idPresentacion, ID_SUCURSAL_INVENTARIO, cantidadIngresada]);
 
                 const sqlUpdateCosto = `
                     UPDATE presentaciones_producto 
@@ -101,13 +97,11 @@ export const registrarEntrada = async (req, res) => {
                 });
             });
 
-            res.status(201).json({ message: 'Entrada de inventario procesada con éxito.', id_entrada: idEntrada });
-
+            res.status(201).json({ message: 'Entrada procesada y añadida al inventario general exitosamente.', id_entrada: idEntrada });
         } catch (error) {
             await new Promise((resolve) => connection.rollback(() => resolve()));
             console.error("Error en la transacción de entrada:", error);
             res.status(500).json({ message: 'Error al registrar la entrada. Intente de nuevo.' });
-
         } finally {
             connection.release();
         }

@@ -117,7 +117,7 @@ export const obtenerReporteGerencial = async (req, res) => {
             JOIN presentaciones_producto pp ON inv.id_presentacion = pp.id_presentacion
             JOIN productos p ON pp.id_producto = p.id_prod
             LEFT JOIN categorias_producto c ON p.categ_prod = c.id_categ
-            WHERE inv.stock <= pp.punto_reorden ${sucursalFiltroInventario}
+            WHERE inv.id_sucursal = 1 AND inv.stock <= pp.punto_reorden
             ORDER BY inv.stock ASC
         `;
 
@@ -193,8 +193,8 @@ export const obtenerReporteGerencial = async (req, res) => {
             FROM presentaciones_producto pp
             JOIN productos p ON pp.id_producto = p.id_prod
             LEFT JOIN categorias_producto c ON p.categ_prod = c.id_categ
-            JOIN inventario_sucursales inv ON pp.id_presentacion = inv.id_presentacion
-            WHERE inv.stock > 0 ${sucursalFiltroInventario}
+            JOIN inventario_sucursales inv ON pp.id_presentacion = inv.id_presentacion AND inv.id_sucursal = 1
+            WHERE inv.stock > 0
             GROUP BY pp.id_presentacion, p.nombre_base, c.descrip_categ, pp.precio_venta_usd
             ORDER BY c.descrip_categ, p.nombre_base ASC
         `;
@@ -213,7 +213,7 @@ export const obtenerReporteGerencial = async (req, res) => {
             ORDER BY inversion_total_usd DESC
         `;
 
-        const stockTotalizacionSql = `
+       const stockTotalizacionSql = `
             SELECT 
                 p.nombre_base AS producto,
                 pp.talla,
@@ -236,7 +236,7 @@ export const obtenerReporteGerencial = async (req, res) => {
             JOIN presentaciones_producto pp ON inv.id_presentacion = pp.id_presentacion
             JOIN productos p ON pp.id_producto = p.id_prod
             LEFT JOIN categorias_producto c ON p.categ_prod = c.id_categ
-            WHERE 1=1 ${sucursalFiltroInventario}
+            WHERE inv.id_sucursal = 1
             GROUP BY pp.id_presentacion, p.nombre_base, pp.talla, pp.color, pp.codigo_barras, c.descrip_categ, pp.costo_usd
             ORDER BY stock_actual DESC
         `;

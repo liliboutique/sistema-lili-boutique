@@ -1,5 +1,7 @@
 import db from '../config/db.js';
 
+const ID_SUCURSAL_INVENTARIO = 1;
+
 const executeQuery = (connection, sql, params) => {
     return new Promise((resolve, reject) => {
         connection.query(sql, params, (err, results) => {
@@ -35,12 +37,14 @@ export const registrarVenta = async (req, res) => {
                     LEFT JOIN inventario_sucursales inv ON pp.id_presentacion = inv.id_presentacion AND inv.id_sucursal = ?
                     WHERE pp.id_presentacion = ?
                 `;
-                const dbInfo = await executeQuery(connection, sqlCheckInfo, [id_sucursal, item.id_presentacion]);
+                const dbInfo = await executeQuery(connection, sqlCheckInfo, [ID_SUCURSAL_INVENTARIO, item.id_presentacion]);
                 if (dbInfo.length === 0) throw new Error(`El producto con ID ${item.id_presentacion} no existe.`);
+
                 const stockDisponible = dbInfo[0].stock_actual;
                 const precioReal = dbInfo[0].precio_venta_usd;
+
                 if (item.cantidad > stockDisponible) {
-                    throw new Error(`Stock insuficiente. Intentaste vender ${item.cantidad}, pero solo quedan ${stockDisponible} disponibles.`);
+                    throw new Error(`Stock insuficiente en el inventario general. Intentaste vender \({item.cantidad}, pero solo quedan\){stockDisponible} disponibles.`);
                 }
                 totalRealVenta += (item.cantidad * precioReal);
             }
@@ -49,9 +53,10 @@ export const registrarVenta = async (req, res) => {
             const resultVenta = await executeQuery(
                 connection,
                 `INSERT INTO ventas (id_cliente, fecha, total_pagado, descuento_usd, motivo_ajuste, id_usuario, id_sucursal, recargo_mora, aplica_mora) 
-                 VALUES (?, NOW(), ?, ?, ?, ?, ?, 0.00, ?)`,
+                  VALUES (?, NOW(), ?, ?, ?, ?, ?, 0.00, ?)`,
                 [id_cliente, total_pagado_usd, descuento_usd, motivo_ajuste, id_usuario, id_sucursal, aplicaMoraValue]
             );
+
             const id_venta = resultVenta.insertId;
 
             for (const item of items) {
@@ -64,10 +69,11 @@ export const registrarVenta = async (req, res) => {
                     `INSERT INTO detalles_venta (id_venta, id_presentacion, cantidad_vendida, precio_unitario, subtotal) VALUES (?, ?, ?, ?, ?)`,
                     [id_venta, item.id_presentacion, item.cantidad, precioReal, subtotal]
                 );
+
                 await executeQuery(
                     connection,
                     `UPDATE inventario_sucursales SET stock = stock - ? WHERE id_presentacion = ? AND id_sucursal = ?`,
-                    [item.cantidad, item.id_presentacion, id_sucursal]
+                    [item.cantidad, item.id_presentacion, ID_SUCURSAL_INVENTARIO]
                 );
             }
 
@@ -133,6 +139,121 @@ export const registrarVenta = async (req, res) => {
     });
 };
 
+export const procesarDevolucion = async (req, res) => {
+    const { id_venta, id_cliente, items_devueltos } = req.body;
+    const id_usuario = req.user?.id_usu || 2;
+
+    if (!id_venta || !id_cliente) {
+        return res.status(400).json({ success: false, message: 'Faltan datos obligatorios.' });
+    }
+    if (!items_devueltos || items_devueltos.length === 0) {
+        return res.status(400).json({ success: false, message: 'No hay artículos seleccionados para devolver.' });
+    }
+
+    db.getConnection(async (err, connection) => {
+        if (err) return res.status(500).json({ success: false, message: 'Error de conexión a la base de datos.' });
+        try {
+            await new Promise((resolve, reject) => connection.beginTransaction(err => err ? reject(err) : resolve()));
+            
+            let total_valor_devuelto = 0;
+            
+            for (const item of items_devueltos) {
+                if (item.cantidad <= 0) throw new Error("La cantidad a devolver debe ser mayor a cero.");
+                
+                const sqlCheckDetalle = `
+                    SELECT id_detalle, cantidad_vendida, precio_unitario, IFNULL(cantidad_devuelta, 0) as cantidad_devuelta 
+                    FROM detalles_venta 
+                    WHERE id_venta = ? AND id_presentacion = ?
+                `;
+                const detalleOriginal = await executeQuery(connection, sqlCheckDetalle, [id_venta, item.id_presentacion]);
+                
+                if (detalleOriginal.length === 0) {
+                    throw new Error(`El artículo seleccionado no pertenece a la venta original.`);
+                }
+
+                const { id_detalle, cantidad_vendida, precio_unitario, cantidad_devuelta } = detalleOriginal[0];
+                const disponibleParaDevolver = cantidad_vendida - cantidad_devuelta;
+
+                if (item.cantidad > disponibleParaDevolver) {
+                    throw new Error(`No puedes devolver \({item.cantidad} unidad(es). Máximo disponible:\){disponibleParaDevolver}.`);
+                }
+
+                const valor_devuelto = item.cantidad * precio_unitario;
+                total_valor_devuelto += valor_devuelto;
+            
+                await executeQuery(
+                    connection,
+                    `UPDATE inventario_sucursales 
+                       SET stock = stock + ? 
+                       WHERE id_presentacion = ? AND id_sucursal = ?`,
+                    [item.cantidad, item.id_presentacion, ID_SUCURSAL_INVENTARIO]
+                );
+
+                await executeQuery(
+                    connection,
+                    `UPDATE detalles_venta 
+                       SET cantidad_devuelta = cantidad_devuelta + ? 
+                       WHERE id_detalle = ?`,
+                    [item.cantidad, id_detalle]
+                );
+            }
+
+            const sqlVenta = `
+                SELECT descuento_usd, recargo_mora, total_pagado,
+                       (SELECT SUM(subtotal - (IFNULL(cantidad_devuelta, 0) * precio_unitario)) 
+                        FROM detalles_venta WHERE id_venta = ?) AS nuevo_subtotal
+                FROM ventas WHERE id_venta = ?
+            `;
+            const resVenta = await executeQuery(connection, sqlVenta, [id_venta, id_venta]);
+            const { descuento_usd, recargo_mora, total_pagado, nuevo_subtotal } = resVenta[0];
+
+            const nuevo_total_factura = (Number(nuevo_subtotal) - Number(descuento_usd) + Number(recargo_mora));
+            let saldo_a_favor = Number(total_pagado) - nuevo_total_factura;
+
+            const sqlNotasPrevias = `SELECT SUM(monto_usd) as emitido FROM notas_credito WHERE id_venta_origen = ?`;
+            const resNotasPrevias = await executeQuery(connection, sqlNotasPrevias, [id_venta]);
+            const notas_emitidas = Number(resNotasPrevias[0].emitido) || 0;
+
+            let monto_nota_credito = saldo_a_favor > 0 ? saldo_a_favor - notas_emitidas : 0;
+            let id_nota_generada = null;
+
+            if (monto_nota_credito > 0.01) {
+                const resultNota = await executeQuery(
+                    connection,
+                    `INSERT INTO notas_credito (id_cliente, id_venta_origen, monto_usd, saldo_restante_usd, estado) 
+                       VALUES (?, ?, ?, ?, 'DISPONIBLE')`,
+                    [id_cliente, id_venta, monto_nota_credito, monto_nota_credito]
+                );
+                id_nota_generada = resultNota.insertId;
+            }
+
+            let descBitacora = `Reingreso por devolución (Venta #\({id_venta}). Valor prendas:\)${total_valor_devuelto.toFixed(2)}.`;
+            if (nuevo_total_factura > 0 || total_pagado < (nuevo_total_factura + total_valor_devuelto)) {
+                descBitacora += ` La deuda de la factura se redujo automáticamente.`;
+            }
+            if (monto_nota_credito > 0.01) descBitacora += ` Se generó nota de crédito #\({id_nota_generada} por\)${monto_nota_credito.toFixed(2)}.`;
+
+            await executeQuery(
+                connection,
+                `INSERT INTO bitacora_auditoria (id_usuario, accion, modulo, descripcion) 
+                  VALUES (?, 'DEVOLUCION', 'INVENTARIO', ?)`,
+                [id_usuario, descBitacora]
+            );
+
+            await new Promise((resolve, reject) => connection.commit(err => err ? reject(err) : resolve()));
+            res.status(201).json({ 
+                success: true, 
+                message: descBitacora, 
+                id_nota: id_nota_generada 
+            });
+            connection.release();
+        } catch (error) {
+            connection.rollback(() => connection.release());
+            res.status(400).json({ success: false, message: error.message || 'Ocurrió un error al procesar la devolución.' });
+        }
+    });
+};
+
 export const obtenerVentas = async (req, res) => {
     const id_sucursal_token = req.user?.id_sucursal ? Number(req.user.id_sucursal) : 1;
     const rol_usuario = req.user?.rol_usu ? Number(req.user.rol_usu) : 2;
@@ -153,11 +274,10 @@ export const obtenerVentas = async (req, res) => {
         WHERE v.id_cliente != 1
     `;
     const params = [];
-
     if (rol_usuario === 1 && req_sucursal) {
         sql += ` AND v.id_sucursal = ?`;
         params.push(req_sucursal);
-    } else {
+    } else if (rol_usuario !== 1) {
         sql += ` AND v.id_sucursal = ?`;
         params.push(id_sucursal_token);
     }
@@ -166,7 +286,6 @@ export const obtenerVentas = async (req, res) => {
         sql += ` AND (DATE(v.fecha) BETWEEN ? AND ? OR DATE((SELECT MAX(fecha) FROM pagos_venta pv WHERE pv.id_venta = v.id_venta)) BETWEEN ? AND ?)`;
         params.push(fecha_inicio, fecha_fin, fecha_inicio, fecha_fin);
     }
-
     sql += ` ORDER BY v.fecha DESC LIMIT 150`;
 
     db.query(sql, params, (err, results) => {
@@ -183,20 +302,20 @@ export const obtenerDetalleVenta = async (req, res) => {
             c.ra_soc_cli as cliente, c.ced_rif_cli,
             CONCAT(e.nom_emp, ' ', e.ape_emp) AS operador,
             s.nombre as sucursal
-    FROM ventas v
+            FROM ventas v
             LEFT JOIN clientes c ON v.id_cliente = c.id_cli 
             LEFT JOIN usuarios u ON v.id_usuario = u.id_usu
             LEFT JOIN empleados e ON u.emp_usu = e.id_emp
             LEFT JOIN sucursales s ON v.id_sucursal = s.id_sucursal
             WHERE v.id_venta = ?`;
-
-       const detallesSql = `
-    SELECT dv.id_presentacion, dv.cantidad_vendida as cantidad, dv.precio_unitario, dv.subtotal,
-            dv.cantidad_devuelta, p.nombre_base 
-    FROM detalles_venta dv
-    JOIN presentaciones_producto pp ON dv.id_presentacion = pp.id_presentacion
-    JOIN productos p ON pp.id_producto = p.id_prod
-    WHERE dv.id_venta = ?`;
+        
+        const detallesSql = `
+            SELECT dv.id_presentacion, dv.cantidad_vendida as cantidad, dv.precio_unitario, dv.subtotal,
+                   dv.cantidad_devuelta, p.nombre_base 
+            FROM detalles_venta dv
+            JOIN presentaciones_producto pp ON dv.id_presentacion = pp.id_presentacion
+            JOIN productos p ON pp.id_producto = p.id_prod
+            WHERE dv.id_venta = ?`;
 
         const pagosSql = `
             SELECT pv.monto_usd, pv.es_vuelto, mp.descripcion as metodo, pv.fecha
@@ -237,122 +356,4 @@ export const obtenerMetodosPago = async (req, res) => {
         console.error('Error interno:', error);
         res.status(500).json({ message: 'Error interno al procesar los métodos de pago.' });
     }
-};
-
-export const procesarDevolucion = async (req, res) => {
-    const { id_venta, id_cliente, items_devueltos } = req.body;
-    const id_sucursal = req.user?.id_sucursal || 1;
-    const id_usuario = req.user?.id_usu || 2;
-
-    if (!id_venta || !id_cliente) {
-        return res.status(400).json({ success: false, message: 'Faltan datos obligatorios.' });
-    }
-    if (!items_devueltos || items_devueltos.length === 0) {
-        return res.status(400).json({ success: false, message: 'No hay artículos seleccionados para devolver.' });
-    }
-
-    db.getConnection(async (err, connection) => {
-        if (err) return res.status(500).json({ success: false, message: 'Error de conexión a la base de datos.' });
-        try {
-            await new Promise((resolve, reject) => connection.beginTransaction(err => err ? reject(err) : resolve()));
-            
-            let total_valor_devuelto = 0;
-            
-            for (const item of items_devueltos) {
-                if (item.cantidad <= 0) throw new Error("La cantidad a devolver debe ser mayor a cero.");
-                
-                const sqlCheckDetalle = `
-                    SELECT id_detalle, cantidad_vendida, precio_unitario, IFNULL(cantidad_devuelta, 0) as cantidad_devuelta 
-                     FROM detalles_venta 
-                     WHERE id_venta = ? AND id_presentacion = ?
-                `;
-                const detalleOriginal = await executeQuery(connection, sqlCheckDetalle, [id_venta, item.id_presentacion]);
-                
-                if (detalleOriginal.length === 0) {
-                    throw new Error(`El artículo seleccionado no pertenece a la venta original.`);
-                }
-
-                const { id_detalle, cantidad_vendida, precio_unitario, cantidad_devuelta } = detalleOriginal[0];
-                const disponibleParaDevolver = cantidad_vendida - cantidad_devuelta;
-
-                if (item.cantidad > disponibleParaDevolver) {
-                    throw new Error(`No puedes devolver ${item.cantidad} unidad(es). Máximo disponible: ${disponibleParaDevolver}.`);
-                }
-
-                const valor_devuelto = item.cantidad * precio_unitario;
-                total_valor_devuelto += valor_devuelto;
-
-                await executeQuery(
-                    connection,
-                    `UPDATE inventario_sucursales 
-                      SET stock = stock + ? 
-                      WHERE id_presentacion = ? AND id_sucursal = ?`,
-                    [item.cantidad, item.id_presentacion, id_sucursal]
-                );
-
-                await executeQuery(
-                    connection,
-                    `UPDATE detalles_venta 
-                      SET cantidad_devuelta = cantidad_devuelta + ? 
-                      WHERE id_detalle = ?`,
-                    [item.cantidad, id_detalle]
-                );
-            }
-
-          const sqlVenta = `
-                SELECT descuento_usd, recargo_mora, total_pagado,
-                       (SELECT SUM(subtotal - (IFNULL(cantidad_devuelta, 0) * precio_unitario)) 
-                        FROM detalles_venta WHERE id_venta = ?) AS nuevo_subtotal
-                FROM ventas WHERE id_venta = ?
-            `;
-            const resVenta = await executeQuery(connection, sqlVenta, [id_venta, id_venta]);
-            const { descuento_usd, recargo_mora, total_pagado, nuevo_subtotal } = resVenta[0];
-
-            const nuevo_total_factura = (Number(nuevo_subtotal) - Number(descuento_usd) + Number(recargo_mora));
-
-            let saldo_a_favor = Number(total_pagado) - nuevo_total_factura;
-
-            const sqlNotasPrevias = `SELECT SUM(monto_usd) as emitido FROM notas_credito WHERE id_venta_origen = ?`;
-            const resNotasPrevias = await executeQuery(connection, sqlNotasPrevias, [id_venta]);
-            const notas_emitidas = Number(resNotasPrevias[0].emitido) || 0;
-
-            let monto_nota_credito = saldo_a_favor > 0 ? saldo_a_favor - notas_emitidas : 0;
-
-            let id_nota_generada = null;
-            if (monto_nota_credito > 0.01) {
-                const resultNota = await executeQuery(
-                    connection,
-                    `INSERT INTO notas_credito (id_cliente, id_venta_origen, monto_usd, saldo_restante_usd, estado)
-                       VALUES (?, ?, ?, ?, 'DISPONIBLE')`,
-                    [id_cliente, id_venta, monto_nota_credito, monto_nota_credito]
-                );
-                id_nota_generada = resultNota.insertId;
-            }
-
-            let descBitacora = `Reingreso por devolución (Venta #${id_venta}). Valor prendas: $${total_valor_devuelto.toFixed(2)}.`;
-            if (nuevo_total_factura > 0 || total_pagado < (nuevo_total_factura + total_valor_devuelto)) {
-                descBitacora += ` La deuda de la factura se redujo automáticamente.`;
-            }
-            if (monto_nota_credito > 0.01) descBitacora += ` Se generó nota de crédito #${id_nota_generada} por $${monto_nota_credito.toFixed(2)}.`;
-
-            await executeQuery(
-                connection,
-                `INSERT INTO bitacora_auditoria (id_usuario, accion, modulo, descripcion)
-                  VALUES (?, 'DEVOLUCION', 'INVENTARIO', ?)`,
-                [id_usuario, descBitacora]
-            );
-
-            await new Promise((resolve, reject) => connection.commit(err => err ? reject(err) : resolve()));
-
-            res.status(201).json({ 
-                 success: true, 
-                 message: descBitacora, 
-                 id_nota: id_nota_generada 
-            });
-            connection.release();
-        } catch (error) {
-            connection.rollback(() => connection.release());
-            res.status(400).json({ success: false, message: error.message || 'Ocurri  un error al procesar la devoluci n.' });
-        }
-    });
 };
