@@ -17,7 +17,7 @@ const validarDatosMetodo = (descripcion) => {
 };
 
 export const obtenerMetodosPago = async (req, res) => {
-    const sql = 'SELECT id_metodo, descripcion, moneda FROM metodos_pago ORDER BY id_metodo DESC';
+    const sql = 'SELECT id_metodo, descripcion, moneda, aplica_descuento FROM metodos_pago ORDER BY id_metodo DESC';
     try {
         const results = await queryPromise(sql, []);
         res.status(200).json(results);
@@ -27,14 +27,14 @@ export const obtenerMetodosPago = async (req, res) => {
 };
 
 export const crearMetodoPago = async (req, res) => {
-    const { descripcion, moneda } = req.body;
+    const { descripcion, moneda, aplica_descuento } = req.body;
     const errorValidacion = validarDatosMetodo(descripcion);
     if (errorValidacion) return res.status(400).json({ message: errorValidacion });
-
-    const sql = 'INSERT INTO metodos_pago (descripcion, moneda) VALUES (?, ?)';
+    
+    const permiteDesc = (aplica_descuento === true || aplica_descuento === 1 || aplica_descuento === '1') ? 1 : 0;
+    const sql = 'INSERT INTO metodos_pago (descripcion, moneda, aplica_descuento) VALUES (?, ?, ?)';
     try {
-        const result = await queryPromise(sql, [descripcion, moneda]);
-
+        const result = await queryPromise(sql, [descripcion, moneda, permiteDesc]);
         res.status(201).json({
             message: 'Método registrado exitosamente.',
             id_metodo: result.insertId
@@ -46,22 +46,20 @@ export const crearMetodoPago = async (req, res) => {
 
 export const actualizarMetodoPago = async (req, res) => {
     const { id } = req.params;
-    const { descripcion, moneda } = req.body;
-
+    const { descripcion, moneda, aplica_descuento } = req.body;
     if (id == 120009) {
         return res.status(403).json({ message: 'No se puede editar el método "Nota de Crédito".' });
     }
-
     const errorValidacion = validarDatosMetodo(descripcion);
     if (errorValidacion) return res.status(400).json({ message: errorValidacion });
-
+    
+    const permiteDesc = (aplica_descuento === true || aplica_descuento === 1 || aplica_descuento === '1') ? 1 : 0;
     try {
-        const sql = `UPDATE metodos_pago SET descripcion = ?, moneda = ? WHERE id_metodo = ?`;
-        const result = await queryPromise(sql, [descripcion, moneda, id]);
+        const sql = `UPDATE metodos_pago SET descripcion = ?, moneda = ?, aplica_descuento = ? WHERE id_metodo = ?`;
+        const result = await queryPromise(sql, [descripcion, moneda, permiteDesc, id]);
         if (result.affectedRows === 0) return res.status(404).json({ message: 'Método no encontrado.' });
-
         res.status(200).json({ message: 'Método actualizado correctamente.' });
-   } catch (err) {
+    } catch (err) {
         res.status(500).json({ message: 'Error en la base de datos al actualizar método.' });
     }
 };
