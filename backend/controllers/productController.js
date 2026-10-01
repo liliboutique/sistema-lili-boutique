@@ -6,11 +6,19 @@ const queryPromise = (sql, params) => new Promise((resolve, reject) => db.query(
 
 const generarCodigo13 = (id, index) => {
     const timePart = Date.now().toString().slice(-8); 
+<<<<<<< HEAD
     const idPart = id.toString().padStart(3, '0').slice(-3);
     const idxPart = index.toString().padStart(1, '0').slice(-1);
     return `2\({timePart}\){idPart}${idxPart}`; 
 };
 
+=======
+    const idPart = id.toString().padStart(3, '0').slice(-3); 
+    const idxPart = index.toString().padStart(1, '0').slice(-1); 
+    
+    return `2${timePart}${idPart}${idxPart}`; 
+};
+>>>>>>> 7125f9e (Subir carpeta backend)
 const validarIntegridadProducto = (nombre, margen, presentaciones) => {
     if (!nombre || nombre.trim().length < 3) return 'El nombre base del producto debe tener al menos 3 letras.';
     if (Number(margen) < 0) return 'El margen de ganancia no puede ser negativo.';
